@@ -1,0 +1,8 @@
+# FASTag Step 3 — Write RFID config to Aerospike
+STEP_ID=3
+TYPE=EXECUTE
+ENGINE=AEROSPIKE
+FIELD_MAP=plaza_code:plazaCode,rfid_endpoint:rfidEndpoint,lane_count:laneCount
+QUERY=INSERT INTO fastag.rfid_config (PK, rfidEndpoint, laneCount)
+      VALUES (':plazaCode', ':rfidEndpoint', ':laneCount')
+COMPENSATES_STEP_ID=

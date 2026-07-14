@@ -110,13 +110,14 @@ public class StepLoader {
      * until the next tag or end of file.
      */
     private StepCommand parseStepFile(String filePath) {
-        Integer    stepId             = null;
-        StepType   type               = null;
-        StepEngine engine             = StepEngine.SQL;
-        Integer    compensatesStepId  = null;
-        String     expectedResult     = null;
-        List<String> queryLines       = new ArrayList<>();
-        boolean    readingQuery       = false;
+        Integer             stepId            = null;
+        StepType            type              = null;
+        StepEngine          engine            = StepEngine.SQL;
+        Integer             compensatesStepId = null;
+        String              expectedResult    = null;
+        List<String>        queryLines        = new ArrayList<>();
+        boolean             readingQuery      = false;
+        Map<String, String> fieldMap          = new java.util.LinkedHashMap<>();
 
         try (BufferedReader reader = new BufferedReader(new FileReader(filePath))) {
             String line;
@@ -154,6 +155,23 @@ public class StepLoader {
                     String val = trimmed.split("=", 2)[1].trim();
                     expectedResult = val.isBlank() ? null : val;
 
+                } else if (upper.startsWith("FIELD_MAP=")) {
+                    /*
+                     * Parse FIELD_MAP=csvCol1:placeholder1,csvCol2:placeholder2
+                     * Each entry maps one CSV column name to one :placeholder name.
+                     * Empty FIELD_MAP tag is valid — step uses raw row keys.
+                     */
+                    readingQuery = false;
+                    String mapVal = trimmed.split("=", 2)[1].trim();
+                    if (!mapVal.isBlank()) {
+                        for (String entry : mapVal.split(",")) {
+                            String[] parts = entry.trim().split(":", 2);
+                            if (parts.length == 2) {
+                                fieldMap.put(parts[0].trim(), parts[1].trim());
+                            }
+                        }
+                    }
+
                 } else if (upper.startsWith("QUERY=")) {
                     readingQuery = true;
                     String firstLine = trimmed.split("=", 2)[1].trim();
@@ -172,7 +190,7 @@ public class StepLoader {
         }
 
         return buildAndValidate(stepId, type, engine, queryLines,
-            compensatesStepId, expectedResult, filePath);
+            compensatesStepId, expectedResult, fieldMap, filePath);
     }
 
     /**
@@ -182,7 +200,7 @@ public class StepLoader {
     private StepCommand buildAndValidate(Integer stepId, StepType type,
                                           StepEngine engine, List<String> queryLines,
                                           Integer compensatesStepId, String expectedResult,
-                                          String filePath) {
+                                          Map<String, String> fieldMap, String filePath) {
         if (stepId == null) {
             throw new IllegalStateException("STEP_ID missing in: " + filePath);
         }
@@ -205,6 +223,7 @@ public class StepLoader {
             .query(String.join(" ", queryLines).trim())
             .compensatesStepId(compensatesStepId)
             .expectedResult(expectedResult)
+            .fieldMap(fieldMap)  // csv column → placeholder mapping for this step
             .build();
     }
 
