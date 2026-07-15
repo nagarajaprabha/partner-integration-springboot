@@ -5,261 +5,247 @@ import com.integration.core.Pipeline;
 import com.integration.core.StepCommand;
 import com.integration.core.StepLoader;
 import com.integration.core.ValidationRule;
+import com.jcraft.jsch.ChannelSftp;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.io.FileUtils;
-import org.apache.commons.io.filefilter.FileFilterUtils;
-import org.apache.commons.io.monitor.FileAlterationListenerAdaptor;
-import org.apache.commons.io.monitor.FileAlterationMonitor;
-import org.apache.commons.io.monitor.FileAlterationObserver;
+import org.springframework.integration.sftp.session.SftpRemoteFileTemplate;
 
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 
 /**
  * ═══════════════════════════════════════════════════════════════════
- * UseCasePoller — File Presence Watcher per Use Case
+ * UseCasePoller — SFTP Poller for One Use Case
  * ═══════════════════════════════════════════════════════════════════
  *
- * Uses Apache Commons IO FileAlterationMonitor — no custom thread
- * management, no custom polling loop.
+ * Uses Spring Integration SftpRemoteFileTemplate — no manual JSch
+ * session/channel management needed.
  *
- * Apache Commons IO handles:
- *   - Directory watching via FileAlterationObserver
- *   - File creation event via FileAlterationListenerAdaptor.onFileCreate()
- *   - Watcher thread lifecycle (start/stop)
- *   - Polling interval configuration
+ * Spring Integration handles:
+ *   - SFTP session lifecycle (open/close/reconnect)
+ *   - Remote file listing via ChannelSftp.ls()
+ *   - File download to local staging folder
+ *   - Remote file rename (move to processed/)
  *
- * One UseCasePoller instance per use case — all run simultaneously
- * in independent watcher threads. DMT and CMS process files
- * at the same time without blocking each other. (Option A)
+ * One UseCasePoller instance per use case.
+ * All pollers run in separate threads via PollerManager's
+ * ThreadPoolTaskScheduler — simultaneous onboarding. (Option A)
  *
- * On new file detected:
- *   1. Resolve FileReader by extension (CSV or JSON)
- *   2. Read all rows via FileReader
- *   3. Run Pipeline.execute() per row
- *   4. Move file to processed/ subfolder (prevents re-processing)
+ * Per-poll cycle:
+ *   1. List files in remote /uploads/{usecase}/
+ *   2. For each file (CSV or JSON only):
+ *      a. Download to local staging folder
+ *      b. Resolve FileReader by extension
+ *      c. Read all rows
+ *      d. Run Pipeline.execute() per row
+ *      e. Rename remote file to /uploads/{usecase}/processed/{ts}_{name}
+ *      f. Delete local staging copy
  *
- * Steps and validation rules loaded once at poller startup from
- * StepLoader cache — no file I/O per row at runtime.
- *
- * Processed folder: {uploadDir}/processed/{timestamp}_{filename}
- * Ensures original file is never re-processed on next poll cycle.
+ * Steps and validation rules loaded from StepLoader cache at first poll.
+ * No file I/O per row at pipeline execution time.
  */
 @Slf4j
-public class UseCasePoller {
+public class UseCasePoller implements Runnable {
 
-    private final String              useCase;
-    private final String              uploadDir;
-    private final long                pollIntervalMs;
-    private final Pipeline            pipeline;
-    private final StepLoader          stepLoader;
-    private final FileReaderResolver  readerResolver;
-    private final ValidationRuleLoader ruleLoader;
-    private final String              activeProfile;
+    private final String                 useCase;
+    private final String                 remoteUploadPath;
+    private final String                 remoteProcessedPath;
+    private final String                 localStagingPath;
+    private final SftpRemoteFileTemplate sftpTemplate;
+    private final Pipeline               pipeline;
+    private final StepLoader             stepLoader;
+    private final FileReaderResolver     readerResolver;
+    private final ValidationRuleLoader   ruleLoader;
+    private final String                 activeProfile;
 
-    /*
-     * Apache Commons IO FileAlterationMonitor — manages the watcher thread.
-     * Stopped cleanly on application shutdown.
-     */
-    private FileAlterationMonitor monitor;
+    // Cached at first poll — steps are constant per use case
+    private List<StepCommand>    cachedSteps;
+    private List<ValidationRule> cachedRules;
 
     public UseCasePoller(String useCase,
-                         String uploadDir,
-                         long pollIntervalMs,
+                         String sftpUploadRoot,
+                         String localStagingRoot,
+                         SftpRemoteFileTemplate sftpTemplate,
                          Pipeline pipeline,
                          StepLoader stepLoader,
                          FileReaderResolver readerResolver,
                          ValidationRuleLoader ruleLoader,
                          String activeProfile) {
-        this.useCase        = useCase;
-        this.uploadDir      = uploadDir;
-        this.pollIntervalMs = pollIntervalMs;
-        this.pipeline       = pipeline;
-        this.stepLoader     = stepLoader;
-        this.readerResolver = readerResolver;
-        this.ruleLoader     = ruleLoader;
-        this.activeProfile  = activeProfile;
+        this.useCase             = useCase;
+        this.remoteUploadPath    = sftpUploadRoot + "/" + useCase;
+        this.remoteProcessedPath = sftpUploadRoot + "/" + useCase + "/processed";
+        this.localStagingPath    = localStagingRoot + "/" + useCase;
+        this.sftpTemplate        = sftpTemplate;
+        this.pipeline            = pipeline;
+        this.stepLoader          = stepLoader;
+        this.readerResolver      = readerResolver;
+        this.ruleLoader          = ruleLoader;
+        this.activeProfile       = activeProfile;
     }
 
     /**
-     * Starts the file watcher for this use case's upload directory.
-     * Apache Commons IO manages the watcher thread — no manual thread creation.
-     *
-     * Steps and validation rules are loaded from cache at start —
-     * changes to step files are picked up by StepLoader's file watcher separately.
+     * One poll cycle — called by PollerManager scheduler per interval.
+     * Lists remote files, processes each, moves to processed/ on SFTP.
      */
-    public void start() throws Exception {
-        /*
-         * Ensure upload directory and processed/ subfolder exist.
-         * Apache Commons IO FileUtils.forceMkdir() creates all parent dirs.
-         */
-        File uploadFolder    = new File(uploadDir);
-        File processedFolder = new File(uploadDir, "processed");
-        FileUtils.forceMkdir(uploadFolder);
-        FileUtils.forceMkdir(processedFolder);
+    @Override
+    public void run() {
+        log.debug("POLL CYCLE: useCase={} remotePath={}", useCase, remoteUploadPath);
 
         /*
-         * Load steps and validation rules once at startup.
-         * StepLoader cache serves these — no file I/O per row.
+         * Load steps and rules lazily on first poll.
+         * StepLoader cache serves subsequent calls — no file I/O.
          */
-        List<StepCommand>   steps = stepLoader.loadSteps(useCase);
-        List<ValidationRule> rules = ruleLoader.load(useCase);
+        if (cachedSteps == null) {
+            cachedSteps = stepLoader.loadSteps(useCase);
+            cachedRules = ruleLoader.load(useCase);
+            log.info("Steps cached: useCase={} steps={} rules={}",
+                useCase, cachedSteps.size(), cachedRules.size());
+        }
 
-        log.info("Poller starting: useCase={} uploadDir={} steps={} rules={} intervalMs={}",
-            useCase, uploadDir, steps.size(), rules.size(), pollIntervalMs);
+        try {
+            /*
+             * SftpRemoteFileTemplate.execute() — lists remote directory.
+             * Spring Integration handles SFTP session open/close.
+             * Returns null if directory empty — guard added below.
+             */
+            ChannelSftp.LsEntry[] entries = sftpTemplate.execute(session ->
+                session.list(remoteUploadPath + "/*")
+            );
 
-        /*
-         * FileAlterationObserver watches the upload directory.
-         * FileFilterUtils.fileFileFilter() — only watches files, not subdirectories.
-         * This prevents the observer from triggering on processed/ folder events.
-         */
-        FileAlterationObserver observer = new FileAlterationObserver(
-            uploadFolder,
-            FileFilterUtils.and(
-                FileFilterUtils.fileFileFilter(),
-                FileFilterUtils.notFileFilter(
-                    FileFilterUtils.prefixFileFilter(".")  // skip hidden files
-                )
-            )
-        );
-
-        /*
-         * FileAlterationListenerAdaptor — only override onFileCreate().
-         * Apache Commons IO calls this when a new file appears in the directory.
-         * No polling logic, no thread management needed.
-         */
-        observer.addListener(new FileAlterationListenerAdaptor() {
-            @Override
-            public void onFileCreate(File file) {
-                /*
-                 * Skip files inside the processed/ subfolder.
-                 * Observer watches the parent directory — this guard
-                 * prevents triggering on files moved into processed/.
-                 */
-                if (file.getParentFile().getName().equals("processed")) {
-                    return;
-                }
-                log.info("File detected: useCase={} file={}", useCase, file.getName());
-                processFile(file, steps, rules);
+            if (entries == null || entries.length == 0) {
+                log.debug("No files: useCase={}", useCase);
+                return;
             }
-        });
 
-        /*
-         * FileAlterationMonitor manages the watcher thread.
-         * pollIntervalMs controls how often the observer checks for changes.
-         * start() launches the background watcher thread.
-         */
-        monitor = new FileAlterationMonitor(pollIntervalMs, observer);
-        monitor.start();
+            /*
+             * Filter: files only, no hidden files, supported extensions only.
+             * Skips the processed/ subdirectory automatically (isDir check).
+             */
+            Arrays.stream(entries)
+                .filter(e -> !e.getAttrs().isDir())
+                .filter(e -> !e.getFilename().startsWith("."))
+                .filter(e -> isSupportedExtension(e.getFilename()))
+                .forEach(e -> processRemoteFile(e.getFilename()));
 
-        log.info("Poller started: useCase={} watching={}",
-            useCase, uploadFolder.getAbsolutePath());
-    }
-
-    /**
-     * Stops the file watcher cleanly.
-     * Called by PollerManager on application shutdown.
-     */
-    public void stop() {
-        if (monitor != null) {
-            try {
-                monitor.stop();
-                log.info("Poller stopped: useCase={}", useCase);
-            } catch (Exception e) {
-                log.error("Error stopping poller: useCase={} error={}", useCase, e.getMessage());
-            }
+        } catch (Exception e) {
+            log.error("POLL ERROR: useCase={} error={}", useCase, e.getMessage());
         }
     }
 
     // ── Private ───────────────────────────────────────────────────────
 
     /**
-     * Reads file, runs pipeline per row, moves file to processed/.
-     * Always moves the file — even on partial failure — to prevent
-     * re-processing on next poll cycle.
+     * Downloads one remote file, processes all rows, moves to processed/.
+     * Always moves remote file — even on partial failure.
      */
-    private void processFile(File file,
-                             List<StepCommand> steps,
-                             List<ValidationRule> rules) {
-        int succeeded = 0;
-        int failed    = 0;
+    private void processRemoteFile(String filename) {
+        log.info("File detected: useCase={} file={}", useCase, filename);
+
+        String remotePath = remoteUploadPath + "/" + filename;
+        File   localFile  = Paths.get(localStagingPath, filename).toFile();
+        int    succeeded  = 0;
+        int    failed     = 0;
 
         try {
             /*
-             * FileReaderResolver picks CSV or JSON reader by file extension.
-             * Apache Commons IO FilenameUtils used internally.
+             * Create local staging directory.
+             * Apache Commons IO FileUtils.forceMkdir() creates all parents.
              */
-            FileReader reader = readerResolver.resolve(file.getName());
+            FileUtils.forceMkdir(localFile.getParentFile());
+
+            /*
+             * SftpRemoteFileTemplate.get() — downloads remote file.
+             * Spring Integration manages SFTP session.
+             * Apache Commons IO FileUtils.copyInputStreamToFile() writes to disk.
+             */
+            sftpTemplate.get(remotePath,
+                stream -> FileUtils.copyInputStreamToFile(stream, localFile));
+
+            log.info("Downloaded: useCase={} file={} bytes={}",
+                useCase, filename, localFile.length());
+
+            /*
+             * Resolve reader (CSV or JSON) by file extension.
+             * FileReaderResolver uses Apache Commons IO FilenameUtils.
+             */
+            FileReader reader = readerResolver.resolve(filename);
             List<Map<String, String>> rows;
 
-            try (InputStream stream = new FileInputStream(file)) {
+            try (InputStream stream = new FileInputStream(localFile)) {
                 rows = reader.read(stream);
             }
 
             log.info("Processing: useCase={} file={} rows={}",
-                useCase, file.getName(), rows.size());
+                useCase, filename, rows.size());
 
+            /*
+             * Run Pipeline per row — never throws.
+             * All outcomes recorded in ExecutionContext and written to audit.
+             */
             for (Map<String, String> row : rows) {
-                /*
-                 * Pipeline.execute() runs the full fixed pipeline for one row.
-                 * Stages: validate → execute → rollback → post-validate → audit.
-                 * Never throws — all exceptions caught and recorded in context.
-                 */
                 ExecutionContext ctx = pipeline.execute(
-                    useCase, row, steps, rules, activeProfile);
+                    useCase, row, cachedSteps, cachedRules, activeProfile);
 
-                if (ctx.hasFailure()) {
-                    failed++;
-                } else {
-                    succeeded++;
-                }
+                if (ctx.hasFailure()) { failed++;    }
+                else                  { succeeded++; }
             }
 
             log.info("File complete: useCase={} file={} succeeded={} failed={}",
-                useCase, file.getName(), succeeded, failed);
+                useCase, filename, succeeded, failed);
 
         } catch (IOException e) {
-            log.error("File read error: useCase={} file={} error={}",
-                useCase, file.getName(), e.getMessage());
+            log.error("Processing error: useCase={} file={} error={}",
+                useCase, filename, e.getMessage());
         } finally {
             /*
-             * Always move file to processed/ — regardless of outcome.
-             * Timestamp prefix prevents filename collisions on reprocessing.
+             * Always move remote file to processed/ on SFTP.
+             * Prevents re-processing on next poll cycle.
              */
-            moveToProcessed(file);
+            moveRemoteToProcessed(remotePath, filename);
+
+            /*
+             * Delete local staging copy.
+             * Apache Commons IO FileUtils.deleteQuietly() never throws.
+             */
+            FileUtils.deleteQuietly(localFile);
         }
     }
 
     /**
-     * Moves processed file to {uploadDir}/processed/{timestamp}_{filename}.
-     * Uses Apache Commons IO FileUtils.moveFile() — atomic on same filesystem.
+     * Renames remote file to /uploads/{usecase}/processed/{ts}_{filename}.
+     * SftpRemoteFileTemplate.rename() — no manual SFTP channel needed.
      */
-    private void moveToProcessed(File file) {
+    private void moveRemoteToProcessed(String remotePath, String filename) {
         try {
-            String timestamp  = String.valueOf(Instant.now().toEpochMilli());
-            Path   destPath   = Paths.get(uploadDir, "processed",
-                timestamp + "_" + file.getName());
+            String processedPath = remoteProcessedPath + "/"
+                + Instant.now().toEpochMilli() + "_" + filename;
+            sftpTemplate.rename(remotePath, processedPath);
+            log.info("Moved to SFTP processed: useCase={} dest={}",
+                useCase, processedPath);
+        } catch (Exception e) {
+            log.error("Move to processed failed: useCase={} file={} error={}",
+                useCase, filename, e.getMessage());
+        }
+    }
 
-            /*
-             * Apache Commons IO FileUtils.moveFile() handles:
-             *   - Cross-filesystem moves (copy + delete)
-             *   - Parent directory creation
-             * No custom move logic needed.
-             */
-            FileUtils.moveFile(file, destPath.toFile());
-            log.info("Moved to processed: {}", destPath.getFileName());
-
-        } catch (IOException e) {
-            log.error("Failed to move file to processed: file={} error={}",
-                file.getName(), e.getMessage());
+    /**
+     * Returns true if filename has a reader-supported extension.
+     * Single source of truth — delegates to FileReaderResolver.
+     */
+    private boolean isSupportedExtension(String filename) {
+        try {
+            readerResolver.resolve(filename);
+            return true;
+        } catch (IllegalArgumentException e) {
+            log.debug("Skipping unsupported file: useCase={} file={}", useCase, filename);
+            return false;
         }
     }
 }
