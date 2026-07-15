@@ -1,5 +1,6 @@
 package com.integration.intake;
 
+import com.integration.audit.ResultReportWriter;
 import com.integration.core.ExecutionContext;
 import com.integration.core.Pipeline;
 import com.integration.core.StepCommand;
@@ -16,6 +17,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Paths;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -26,30 +28,24 @@ import java.util.Map;
  * ═══════════════════════════════════════════════════════════════════
  *
  * Uses Spring Integration SftpRemoteFileTemplate — no manual JSch
- * session/channel management needed.
- *
- * Spring Integration handles:
- *   - SFTP session lifecycle (open/close/reconnect)
- *   - Remote file listing via ChannelSftp.ls()
- *   - File download to local staging folder
- *   - Remote file rename (move to processed/)
- *
- * One UseCasePoller instance per use case.
- * All pollers run in separate threads via PollerManager's
- * ThreadPoolTaskScheduler — simultaneous onboarding. (Option A)
+ * session/channel management.
  *
  * Per-poll cycle:
  *   1. List files in remote /uploads/{usecase}/
- *   2. For each file (CSV or JSON only):
- *      a. Download to local staging folder
- *      b. Resolve FileReader by extension
- *      c. Read all rows
- *      d. Run Pipeline.execute() per row
- *      e. Rename remote file to /uploads/{usecase}/processed/{ts}_{name}
- *      f. Delete local staging copy
+ *   2. For each file (CSV or JSON):
+ *      a. Download to local staging
+ *      b. Read all rows via FileReader
+ *      c. Run Pipeline.execute() per row — collect ExecutionContext list
+ *      d. Generate CSV result report via ResultReportWriter
+ *      e. Upload result report to /uploads/{usecase}/results/
+ *      f. Move original file to /uploads/{usecase}/processed/
+ *      g. Delete local staging copy
+ *
+ * Result report — one CSV file per uploaded data file:
+ *   Path: /uploads/{usecase}/results/{timestamp}_{filename}_result.csv
+ *   Operator downloads this file to review successes, failures, errors.
  *
  * Steps and validation rules loaded from StepLoader cache at first poll.
- * No file I/O per row at pipeline execution time.
  */
 @Slf4j
 public class UseCasePoller implements Runnable {
@@ -57,15 +53,17 @@ public class UseCasePoller implements Runnable {
     private final String                 useCase;
     private final String                 remoteUploadPath;
     private final String                 remoteProcessedPath;
+    private final String                 remoteResultsPath;
     private final String                 localStagingPath;
     private final SftpRemoteFileTemplate sftpTemplate;
     private final Pipeline               pipeline;
     private final StepLoader             stepLoader;
     private final FileReaderResolver     readerResolver;
     private final ValidationRuleLoader   ruleLoader;
+    private final ResultReportWriter     reportWriter;
     private final String                 activeProfile;
 
-    // Cached at first poll — steps are constant per use case
+    // Cached at first poll — constant per use case
     private List<StepCommand>    cachedSteps;
     private List<ValidationRule> cachedRules;
 
@@ -77,26 +75,25 @@ public class UseCasePoller implements Runnable {
                          StepLoader stepLoader,
                          FileReaderResolver readerResolver,
                          ValidationRuleLoader ruleLoader,
+                         ResultReportWriter reportWriter,
                          String activeProfile) {
         this.useCase             = useCase;
         this.remoteUploadPath    = sftpUploadRoot + "/" + useCase;
         this.remoteProcessedPath = sftpUploadRoot + "/" + useCase + "/processed";
+        this.remoteResultsPath   = sftpUploadRoot + "/" + useCase + "/results";
         this.localStagingPath    = localStagingRoot + "/" + useCase;
         this.sftpTemplate        = sftpTemplate;
         this.pipeline            = pipeline;
         this.stepLoader          = stepLoader;
         this.readerResolver      = readerResolver;
         this.ruleLoader          = ruleLoader;
+        this.reportWriter        = reportWriter;
         this.activeProfile       = activeProfile;
     }
 
-    /**
-     * One poll cycle — called by PollerManager scheduler per interval.
-     * Lists remote files, processes each, moves to processed/ on SFTP.
-     */
     @Override
     public void run() {
-        log.debug("POLL CYCLE: useCase={} remotePath={}", useCase, remoteUploadPath);
+        log.debug("POLL CYCLE: useCase={}", useCase);
 
         /*
          * Load steps and rules lazily on first poll.
@@ -111,9 +108,7 @@ public class UseCasePoller implements Runnable {
 
         try {
             /*
-             * SftpRemoteFileTemplate.execute() — lists remote directory.
-             * Spring Integration handles SFTP session open/close.
-             * Returns null if directory empty — guard added below.
+             * List remote directory — Spring Integration handles session.
              */
             ChannelSftp.LsEntry[] entries = sftpTemplate.execute(session ->
                 session.list(remoteUploadPath + "/*")
@@ -125,8 +120,8 @@ public class UseCasePoller implements Runnable {
             }
 
             /*
-             * Filter: files only, no hidden files, supported extensions only.
-             * Skips the processed/ subdirectory automatically (isDir check).
+             * Filter: files only, no hidden files, supported extensions.
+             * Skips processed/ and results/ subdirectories (isDir check).
              */
             Arrays.stream(entries)
                 .filter(e -> !e.getAttrs().isDir())
@@ -142,28 +137,32 @@ public class UseCasePoller implements Runnable {
     // ── Private ───────────────────────────────────────────────────────
 
     /**
-     * Downloads one remote file, processes all rows, moves to processed/.
-     * Always moves remote file — even on partial failure.
+     * Downloads file, runs pipeline per row, generates result report,
+     * uploads report to SFTP results/, moves original to processed/.
      */
     private void processRemoteFile(String filename) {
         log.info("File detected: useCase={} file={}", useCase, filename);
 
         String remotePath = remoteUploadPath + "/" + filename;
         File   localFile  = Paths.get(localStagingPath, filename).toFile();
-        int    succeeded  = 0;
-        int    failed     = 0;
+
+        /*
+         * Collect ExecutionContext for every row — used to generate
+         * the result report after all rows are processed.
+         */
+        List<ExecutionContext> allResults = new ArrayList<>();
 
         try {
             /*
              * Create local staging directory.
-             * Apache Commons IO FileUtils.forceMkdir() creates all parents.
+             * Apache Commons IO FileUtils.forceMkdir().
              */
             FileUtils.forceMkdir(localFile.getParentFile());
 
             /*
-             * SftpRemoteFileTemplate.get() — downloads remote file.
-             * Spring Integration manages SFTP session.
-             * Apache Commons IO FileUtils.copyInputStreamToFile() writes to disk.
+             * Download remote file to local staging.
+             * Spring Integration SftpRemoteFileTemplate.get() handles session.
+             * Apache Commons IO FileUtils.copyInputStreamToFile() writes bytes.
              */
             sftpTemplate.get(remotePath,
                 stream -> FileUtils.copyInputStreamToFile(stream, localFile));
@@ -172,8 +171,7 @@ public class UseCasePoller implements Runnable {
                 useCase, filename, localFile.length());
 
             /*
-             * Resolve reader (CSV or JSON) by file extension.
-             * FileReaderResolver uses Apache Commons IO FilenameUtils.
+             * Resolve reader by file extension — CSV or JSON.
              */
             FileReader reader = readerResolver.resolve(filename);
             List<Map<String, String>> rows;
@@ -187,58 +185,90 @@ public class UseCasePoller implements Runnable {
 
             /*
              * Run Pipeline per row — never throws.
-             * All outcomes recorded in ExecutionContext and written to audit.
+             * Collect every ExecutionContext for the result report.
              */
             for (Map<String, String> row : rows) {
                 ExecutionContext ctx = pipeline.execute(
                     useCase, row, cachedSteps, cachedRules, activeProfile);
-
-                if (ctx.hasFailure()) { failed++;    }
-                else                  { succeeded++; }
+                allResults.add(ctx);
             }
+
+            long succeeded = allResults.stream().filter(r -> !r.hasFailure()).count();
+            long failed    = allResults.size() - succeeded;
 
             log.info("File complete: useCase={} file={} succeeded={} failed={}",
                 useCase, filename, succeeded, failed);
+
+            /*
+             * Generate CSV result report from all row results.
+             * Upload report to /uploads/{usecase}/results/ on SFTP.
+             * Operator downloads this file to review outcomes.
+             */
+            uploadResultReport(filename, allResults);
 
         } catch (IOException e) {
             log.error("Processing error: useCase={} file={} error={}",
                 useCase, filename, e.getMessage());
         } finally {
             /*
-             * Always move remote file to processed/ on SFTP.
-             * Prevents re-processing on next poll cycle.
+             * Always move original file to processed/ on SFTP.
+             * Always delete local staging copy.
              */
             moveRemoteToProcessed(remotePath, filename);
-
-            /*
-             * Delete local staging copy.
-             * Apache Commons IO FileUtils.deleteQuietly() never throws.
-             */
             FileUtils.deleteQuietly(localFile);
         }
     }
 
     /**
-     * Renames remote file to /uploads/{usecase}/processed/{ts}_{filename}.
-     * SftpRemoteFileTemplate.rename() — no manual SFTP channel needed.
+     * Generates CSV result report and uploads to SFTP results/ folder.
+     *
+     * Report path: /uploads/{usecase}/results/{timestamp}_{filename}_result.csv
+     * Operator navigates to this path on SFTP to download and review results.
+     */
+    private void uploadResultReport(String originalFilename,
+                                     List<ExecutionContext> results) {
+        String timestamp   = String.valueOf(Instant.now().toEpochMilli());
+        String reportName  = timestamp + "_" + originalFilename + "_result.csv";
+        String remotePath  = remoteResultsPath + "/" + reportName;
+
+        try {
+            /*
+             * ResultReportWriter generates CSV in memory — no local file.
+             * Returns InputStream of CSV bytes ready for SFTP upload.
+             */
+            InputStream reportStream = reportWriter.generateReport(results, useCase);
+
+            /*
+             * SftpRemoteFileTemplate.send() — uploads InputStream to remote path.
+             * setAutoCreateDirectory(true) in SftpConfig ensures
+             * /results/ folder is created if it does not exist.
+             */
+            sftpTemplate.send(reportStream, remotePath);
+
+            log.info("Result report uploaded: useCase={} path={} rows={}",
+                useCase, remotePath, results.size());
+
+        } catch (Exception e) {
+            log.error("Result report upload failed: useCase={} file={} error={}",
+                useCase, originalFilename, e.getMessage());
+        }
+    }
+
+    /**
+     * Renames remote original file to /uploads/{usecase}/processed/{ts}_{name}.
      */
     private void moveRemoteToProcessed(String remotePath, String filename) {
         try {
             String processedPath = remoteProcessedPath + "/"
                 + Instant.now().toEpochMilli() + "_" + filename;
             sftpTemplate.rename(remotePath, processedPath);
-            log.info("Moved to SFTP processed: useCase={} dest={}",
-                useCase, processedPath);
+            log.info("Moved to SFTP processed: useCase={} file={}", useCase, filename);
         } catch (Exception e) {
             log.error("Move to processed failed: useCase={} file={} error={}",
                 useCase, filename, e.getMessage());
         }
     }
 
-    /**
-     * Returns true if filename has a reader-supported extension.
-     * Single source of truth — delegates to FileReaderResolver.
-     */
     private boolean isSupportedExtension(String filename) {
         try {
             readerResolver.resolve(filename);

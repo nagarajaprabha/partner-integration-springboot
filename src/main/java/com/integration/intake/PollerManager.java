@@ -1,5 +1,6 @@
 package com.integration.intake;
 
+import com.integration.audit.ResultReportWriter;
 import com.integration.core.Pipeline;
 import com.integration.core.StepLoader;
 import jakarta.annotation.PostConstruct;
@@ -55,6 +56,7 @@ public class PollerManager {
     private final FileReaderResolver     readerResolver;
     private final ValidationRuleLoader   ruleLoader;
     private final SftpRemoteFileTemplate sftpTemplate;
+    private final ResultReportWriter     reportWriter;
     private final Environment            environment;
 
     @Value("${sftp.upload.root:/uploads}")
@@ -119,6 +121,7 @@ public class PollerManager {
                     stepLoader,
                     readerResolver,
                     ruleLoader,
+                    reportWriter,
                     activeProfile
                 );
 
