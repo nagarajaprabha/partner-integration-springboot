@@ -192,6 +192,22 @@
             <scope>provided</scope>
         </dependency>
 
+        <!-- ── Spring Security OAuth2 Resource Server ──────────────────── -->
+        <!--
+            Validates JWT tokens issued by any OIDC-compliant provider.
+            Provider-agnostic — configured via issuer-uri in properties.
+            Version managed by Spring Boot BOM 3.3.5 — no known CVEs.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+        </dependency>
+
         <!-- ── Test ─────────────────────────────────────────────────────── -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
